@@ -1,0 +1,10 @@
+__pycache__
+VOCdevkit
+checkpoints
+.vscode
+*.pyc
+__pycache__
+results
+checkpoints_bak
+cityscapes
+test_results
