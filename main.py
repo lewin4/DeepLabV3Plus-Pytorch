@@ -10,8 +10,9 @@ from torch.utils import data
 from datasets import VOCSegmentation, Cityscapes
 from utils import ext_transforms as et
 from metrics import StreamSegMetrics
+from tensorboardX import SummaryWriter
 
-from datasets.dataloader import get_loaders
+from datasets.sewage import get_loaders
 import torch
 import torch.nn as nn
 from utils.visualizer import Visualizer
@@ -34,7 +35,7 @@ def get_argparser():
 
     # Deeplab Options
     parser.add_argument("--model", type=str, default='deeplabv3plus_resnet101',
-                        choices=['deeplabv3_resnet50',  'deeplabv3plus_resnet50',
+                        choices=['deeplabv3_resnet50', 'deeplabv3plus_resnet50',
                                  'deeplabv3_resnet101', 'deeplabv3plus_resnet101',
                                  'deeplabv3_mobilenet', 'deeplabv3plus_mobilenet'], help='model name')
     parser.add_argument("--separable_conv", action='store_true', default=False,
@@ -59,13 +60,15 @@ def get_argparser():
     parser.add_argument("--val_batch_size", type=int, default=2,
                         help='batch size for validation (default: 4)')
     parser.add_argument("--crop_size", type=int, default=513)
-    
+    parser.add_argument("--log_dir", type=str, default="output")
     parser.add_argument("--ckpt", default='', type=str,
                         help="restore from checkpoint")
     parser.add_argument("--continue_training", action='store_true', default=False)
 
     parser.add_argument("--loss_type", type=str, default='cross_entropy',
                         choices=['cross_entropy', 'focal_loss'], help="loss type (default: False)")
+    parser.add_argument("--class_weight", type=list, default=[1.63196599, 6.20771366, 25.68862632],
+                        help="the weight of every class in all data")
     parser.add_argument("--gpu_id", type=str, default='0',
                         help="GPU ID")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
@@ -74,7 +77,7 @@ def get_argparser():
                         help="random seed (default: 1)")
     parser.add_argument("--print_interval", type=int, default=10,
                         help="print interval of loss (default: 10)")
-    parser.add_argument("--val_interval", type=int, default=500,
+    parser.add_argument("--val_interval", type=int, default=100,
                         help="epoch interval for eval (default: 100)")
     parser.add_argument("--download", action='store_true', default=False,
                         help="download datasets")
@@ -100,7 +103,7 @@ def get_dataset(opts):
     """
     if opts.dataset == 'voc':
         train_transform = et.ExtCompose([
-            #et.ExtResize(size=opts.crop_size),
+            # et.ExtResize(size=opts.crop_size),
             et.ExtRandomScale((0.5, 2.0)),
             et.ExtRandomCrop(size=(opts.crop_size, opts.crop_size), pad_if_needed=True),
             et.ExtRandomHorizontalFlip(),
@@ -129,9 +132,9 @@ def get_dataset(opts):
 
     if opts.dataset == 'cityscapes':
         train_transform = et.ExtCompose([
-            #et.ExtResize( 512 ),
+            # et.ExtResize( 512 ),
             et.ExtRandomCrop(size=(opts.crop_size, opts.crop_size)),
-            et.ExtColorJitter( brightness=0.5, contrast=0.5, saturation=0.5 ),
+            et.ExtColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
             et.ExtRandomHorizontalFlip(),
             et.ExtToTensor(),
             et.ExtNormalize(mean=[0.485, 0.456, 0.406],
@@ -139,7 +142,7 @@ def get_dataset(opts):
         ])
 
         val_transform = et.ExtCompose([
-            #et.ExtResize( 512 ),
+            # et.ExtResize( 512 ),
             et.ExtToTensor(),
             et.ExtNormalize(mean=[0.485, 0.456, 0.406],
                             std=[0.229, 0.224, 0.225]),
@@ -159,13 +162,13 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
     if opts.save_val_results:
         if not os.path.exists('results'):
             os.mkdir('results')
-        denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], 
+        denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406],
                                    std=[0.229, 0.224, 0.225])
         img_id = 0
 
     with torch.no_grad():
         for i, (images, labels) in tqdm(enumerate(loader)):
-            
+
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
 
@@ -232,7 +235,7 @@ def main():
     # Setup dataloader
     # if opts.dataset=='voc' and not opts.crop_val:
     #     opts.val_batch_size = 1
-    
+
     # train_dst, val_dst = get_dataset(opts)
     # train_loader = data.DataLoader(
     #     train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2)
@@ -245,8 +248,7 @@ def main():
         batch_size=opts.batch_size,
         num_worker=4,
         pin_memory=True,
-        imgsize=[1024, 512])
-
+        img_shape=[640, 640])
 
     # Set up model
     model_map = {
@@ -259,34 +261,45 @@ def main():
     }
 
     model = model_map[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
-
-    # print(model)
-
+    writer = SummaryWriter(os.path.join(opts.log_dir, opts.model))
     if opts.separable_conv and 'plus' in opts.model:
         network.convert_to_separable_conv(model.classifier)
     utils.set_bn_momentum(model.backbone, momentum=0.01)
-    
+
     # Set up metrics
     metrics = StreamSegMetrics(opts.num_classes)
 
+    vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
+                                      np.int32) if opts.enable_vis else None  # sample idxs for visualization
+    if opts.test_only:
+        model.eval()
+        val_score, ret_samples = validate(
+            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
+        print(metrics.to_str(val_score))
+        return
+
     # Set up optimizer
     optimizer = torch.optim.SGD(params=[
-        {'params': model.backbone.parameters(), 'lr': 0.1*opts.lr},
+        {'params': model.backbone.parameters(), 'lr': 0.1 * opts.lr},
         {'params': model.classifier.parameters(), 'lr': opts.lr},
     ], lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
-    #optimizer = torch.optim.SGD(params=model.parameters(), lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
-    #torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.lr_decay_step, gamma=opts.lr_decay_factor)
-    if opts.lr_policy=='poly':
+    # optimizer = torch.optim.SGD(params=model.parameters(), lr=opts.lr, momentum=0.9, weight_decay=opts.weight_decay)
+    # torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.lr_decay_step, gamma=opts.lr_decay_factor)
+    if opts.lr_policy == 'poly':
         scheduler = utils.PolyLR(optimizer, opts.total_itrs, power=0.9)
-    elif opts.lr_policy=='step':
+    elif opts.lr_policy == 'step':
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opts.step_size, gamma=0.1)
+    else:
+        raise ValueError("should choose a lr policy")
 
     # Set up criterion
-    #criterion = utils.get_loss(opts.loss_type)
+    # criterion = utils.get_loss(opts.loss_type)
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=3, reduction='mean')
+        criterion = nn.CrossEntropyLoss(weight=opts.class_weight, ignore_index=3, reduction='mean')
+    else:
+        raise ValueError("must choose from 'cross_entropy' and 'focal_loss'")
 
     def save_ckpt(path):
         """ save current model
@@ -299,7 +312,7 @@ def main():
             "best_score": best_score,
         }, path)
         print("Model saved as %s" % path)
-    
+
     utils.mkdir('checkpoints')
     # Restore
     best_score = 0.0
@@ -324,21 +337,13 @@ def main():
         model = nn.DataParallel(model)
         model.to(device)
 
-    #==========   Train Loop   ==========#
-    vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
-                                      np.int32) if opts.enable_vis else None  # sample idxs for visualization
-    denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # denormalization for ori images
-
-    if opts.test_only:
-        model.eval()
-        val_score, ret_samples = validate(
-            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
-        print(metrics.to_str(val_score))
-        return
+    # ==========   Train Loop   ==========#
+    # denorm = utils.Denormalize(mean=[0.5330, 0.5463, 0.5493],
+    #                            std=[0.1143, 0.1125, 0.1007])  # denormalization for ori images
 
     interval_loss = 0
-    # print(model)
-    while True: #cur_itrs < opts.total_itrs:
+
+    while True:  # cur_itrs < opts.total_itrs:
         # =====  Train  =====
         model.train()
         cur_epochs += 1
@@ -359,20 +364,23 @@ def main():
             if vis is not None:
                 vis.vis_scalar('Loss', cur_itrs, np_loss)
 
-            if (cur_itrs) % 10 == 0:
-                interval_loss = interval_loss/10
+            if cur_itrs % 10 == 0:
+                interval_loss = interval_loss / 10
+                writer.add_scalar("train_loss", interval_loss, cur_itrs)
                 print("Epoch %d, Itrs %d/%d, Loss=%f" %
                       (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
                 interval_loss = 0.0
 
-            if (cur_itrs) % opts.val_interval == 0:
+            if cur_itrs % opts.val_interval == 0:
                 save_ckpt('checkpoints/latest_%s_os%d.pth' %
-                          (opts.model,opts.output_stride))
+                          (opts.model, opts.output_stride))
 
+                writer.add_scalar()
                 print("validation...")
                 model.eval()
                 val_score, ret_samples = validate(
-                    opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
+                    opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
+                    ret_samples_ids=vis_sample_id)
                 print(metrics.to_str(val_score))
                 if val_score['Mean IoU'] > best_score:  # save best model
                     best_score = val_score['Mean IoU']
@@ -391,11 +399,11 @@ def main():
                     #     concat_img = np.concatenate((img, target, lbl), axis=2)  # concat along width
                     #     vis.vis_image('Sample %d' % k, concat_img)
                 model.train()
-            scheduler.step()  
+            scheduler.step()
 
-            if cur_itrs >=  opts.total_itrs:
+            if cur_itrs >= opts.total_itrs:
                 return
 
-        
+
 if __name__ == '__main__':
     main()
