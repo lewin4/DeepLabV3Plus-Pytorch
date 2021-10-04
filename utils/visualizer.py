@@ -23,7 +23,7 @@ class Visualizer(object):
         
         if self.id is not None:
             name = "[%s]"%self.id + name
-        default_opts = { 'title': name }
+        default_opts = {'title': name}
         if opts is not None:
             default_opts.update(opts)
 
@@ -53,7 +53,7 @@ class Visualizer(object):
         #win = self.cur_win.get(name, None)
 
         tbl_str = "<table width=\"100%\"> "
-        tbl_str+="<tr> \
+        tbl_str += "<tr> \
                  <th>Term</th> \
                  <th>Value</th> \
                  </tr>"
