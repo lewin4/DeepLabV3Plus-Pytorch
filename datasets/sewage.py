@@ -53,7 +53,7 @@ def get_loaders(image_dir,
                 train_transform=None,
                 val_transform=None,
                 ):
-    base_image_size = [1124, 868]
+    base_image_size = [662, 645]
     if train_transform is None:
         train_transform = A.Compose(
             [

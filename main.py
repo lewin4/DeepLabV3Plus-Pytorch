@@ -7,7 +7,6 @@ import argparse
 import numpy as np
 
 from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes
 from utils import ext_transforms as et
 from metrics import StreamSegMetrics
 # from tensorboardX import SummaryWriter
@@ -26,9 +25,9 @@ def get_argparser():
     parser = argparse.ArgumentParser()
 
     # Datset Options
-    parser.add_argument("--img_dir", type=str, default=r'E:\code\TBR\T-pcm\images\trian',
+    parser.add_argument("--img_dir", type=str, default=r'D:\Code\data\sewage\T12-pcm\images\trian',
                         help="path to Dataset")
-    parser.add_argument("--label_dir", type=str, default=r'E:\code\TBR\T-pcm\masks\train',
+    parser.add_argument("--label_dir", type=str, default=r'D:\Code\data\sewage\T12-pcm\masks\train',
                         help='Name of dataset')
     parser.add_argument("--num_classes", type=int, default=3,
                         help="num classes (default: None)")
@@ -77,7 +76,7 @@ def get_argparser():
                         help="random seed (default: 1)")
     parser.add_argument("--print_interval", type=int, default=10,
                         help="print interval of loss (default: 10)")
-    parser.add_argument("--val_interval", type=int, default=100,
+    parser.add_argument("--val_interval", type=int, default=2,
                         help="epoch interval for eval (default: 100)")
     parser.add_argument("--download", action='store_true', default=False,
                         help="download datasets")
@@ -110,7 +109,7 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
         img_id = 0
 
     with torch.no_grad():
-        for i, (images, labels) in tqdm(enumerate(loader)):
+        for i, (images, labels) in enumerate(tqdm(loader)):
 
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
@@ -203,7 +202,9 @@ def main():
         'deeplabv3plus_mobilenet': network.deeplabv3plus_mobilenet
     }
 
-    model = model_map[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
+    model = model_map[opts.model](num_classes=opts.num_classes,
+                                  output_stride=opts.output_stride,
+                                  pretrained_backbone=False)
     # writer = SummaryWriter(os.path.join(opts.log_dir, opts.model))
     if opts.separable_conv and 'plus' in opts.model:
         network.convert_to_separable_conv(model.classifier)
@@ -240,7 +241,7 @@ def main():
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(weight=opts.class_weight, ignore_index=3, reduction='mean')
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor(opts.class_weight), ignore_index=-1, reduction='mean')
     else:
         raise ValueError("must choose from 'cross_entropy' and 'focal_loss'")
 
@@ -254,7 +255,7 @@ def main():
             "scheduler_state": scheduler.state_dict(),
             "best_score": best_score,
         }, path)
-        print("Model saved as %s" % path)
+        print("\nModel saved as %s" % path)
 
     utils.mkdir('checkpoints')
     # Restore
